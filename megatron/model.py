@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from init_megatron import (
+from distributed import (
     VocabUtility,
     copy_to_tensor_model_parallel_region,
     divide,
@@ -16,6 +16,7 @@ from init_megatron import (
     scatter_to_tensor_model_parallel_region,
     vocab_parallel_cross_entropy,
 )
+from random import fork_tensor_model_parallel_rng
 
 
 def init_method_normal(std):
@@ -25,20 +26,84 @@ def init_method_normal(std):
     return init_
 
 
+def _initialize_affine_weight_gpu(weight, init_method):
+    with fork_tensor_model_parallel_rng():
+        init_method(weight)
+
+
+def _initialize_affine_weight_cpu(
+    weight,
+    output_size,
+    input_size,
+    per_partition_size,
+    partition_dim,
+    init_method,
+    stride=1,
+):
+    master_weight = torch.empty(output_size, input_size, dtype=torch.float32, requires_grad=False)
+    init_method(master_weight)
+    master_weight = master_weight.to(dtype=weight.dtype)
+
+    per_partition_per_stride_size = divide(per_partition_size, stride)
+    weight_list = torch.split(master_weight, per_partition_per_stride_size, dim=partition_dim)
+    rank = get_tensor_model_parallel_rank()
+    world_size = get_tensor_model_parallel_world_size()
+    my_weight_list = weight_list[rank::world_size]
+
+    with torch.no_grad():
+        torch.cat(my_weight_list, dim=partition_dim, out=weight)
+
+
 class ColumnParallelLinear(nn.Module):
-    def __init__(self, input_size, output_size, bias=True, gather_output=True, init_method=None):
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        bias=True,
+        gather_output=True,
+        init_method=None,
+        use_cpu_initialization=False,
+        params_dtype=torch.float32,
+    ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.gather_output = gather_output
         self.output_size_per_partition = divide(output_size, get_tensor_model_parallel_world_size())
 
-        self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, input_size))
-        self.bias = nn.Parameter(torch.zeros(self.output_size_per_partition)) if bias else None
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.output_size_per_partition,
+                input_size,
+                dtype=params_dtype,
+                device="cpu" if use_cpu_initialization else torch.cuda.current_device(),
+            )
+        )
+        self.bias = (
+            nn.Parameter(
+                torch.zeros(
+                    self.output_size_per_partition,
+                    dtype=params_dtype,
+                    device="cpu" if use_cpu_initialization else torch.cuda.current_device(),
+                )
+            )
+            if bias
+            else None
+        )
 
         if init_method is None:
             init_method = init_method_normal(0.02)
-        init_method(self.weight)
+        if use_cpu_initialization:
+            _initialize_affine_weight_cpu(
+                self.weight,
+                output_size,
+                input_size,
+                self.output_size_per_partition,
+                partition_dim=0,
+                init_method=init_method,
+            )
+        else:
+            _initialize_affine_weight_gpu(self.weight, init_method)
 
     def forward(self, input_):
         input_parallel = copy_to_tensor_model_parallel_region(input_)
@@ -48,19 +113,55 @@ class ColumnParallelLinear(nn.Module):
 
 
 class RowParallelLinear(nn.Module):
-    def __init__(self, input_size, output_size, bias=True, input_is_parallel=False, init_method=None):
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        bias=True,
+        input_is_parallel=False,
+        init_method=None,
+        use_cpu_initialization=False,
+        params_dtype=torch.float32,
+    ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.input_is_parallel = input_is_parallel
         self.input_size_per_partition = divide(input_size, get_tensor_model_parallel_world_size())
 
-        self.weight = nn.Parameter(torch.empty(output_size, self.input_size_per_partition))
-        self.bias = nn.Parameter(torch.zeros(output_size)) if bias else None
+        self.weight = nn.Parameter(
+            torch.empty(
+                output_size,
+                self.input_size_per_partition,
+                dtype=params_dtype,
+                device="cpu" if use_cpu_initialization else torch.cuda.current_device(),
+            )
+        )
+        self.bias = (
+            nn.Parameter(
+                torch.zeros(
+                    output_size,
+                    dtype=params_dtype,
+                    device="cpu" if use_cpu_initialization else torch.cuda.current_device(),
+                )
+            )
+            if bias
+            else None
+        )
 
         if init_method is None:
             init_method = init_method_normal(0.02)
-        init_method(self.weight)
+        if use_cpu_initialization:
+            _initialize_affine_weight_cpu(
+                self.weight,
+                output_size,
+                input_size,
+                self.input_size_per_partition,
+                partition_dim=1,
+                init_method=init_method,
+            )
+        else:
+            _initialize_affine_weight_gpu(self.weight, init_method)
 
     def forward(self, input_):
         input_parallel = input_ if self.input_is_parallel else scatter_to_tensor_model_parallel_region(input_)
@@ -72,7 +173,14 @@ class RowParallelLinear(nn.Module):
 
 
 class VocabParallelEmbedding(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, init_method=None):
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        init_method=None,
+        use_cpu_initialization=False,
+        params_dtype=torch.float32,
+    ):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -83,11 +191,28 @@ class VocabParallelEmbedding(nn.Module):
             self.tensor_model_parallel_size,
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
-        self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.num_embeddings_per_partition,
+                embedding_dim,
+                dtype=params_dtype,
+                device="cpu" if use_cpu_initialization else torch.cuda.current_device(),
+            )
+        )
 
         if init_method is None:
             init_method = init_method_normal(0.02)
-        init_method(self.weight)
+        if use_cpu_initialization:
+            _initialize_affine_weight_cpu(
+                self.weight,
+                num_embeddings,
+                embedding_dim,
+                self.num_embeddings_per_partition,
+                partition_dim=0,
+                init_method=init_method,
+            )
+        else:
+            _initialize_affine_weight_gpu(self.weight, init_method)
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -119,12 +244,26 @@ class LayerNorm(nn.Module):
 
 
 class ParallelMLP(nn.Module):
-    def __init__(self, emd_size, scale=4, dropout=0.1):
+    def __init__(self, emd_size, scale=4, dropout=0.1, use_cpu_initialization=False, params_dtype=torch.float32):
         super().__init__()
         init_method = init_method_normal(0.02)
-        self.c_fc = ColumnParallelLinear(emd_size, scale * emd_size, gather_output=False, init_method=init_method)
+        self.c_fc = ColumnParallelLinear(
+            emd_size,
+            scale * emd_size,
+            gather_output=False,
+            init_method=init_method,
+            use_cpu_initialization=use_cpu_initialization,
+            params_dtype=params_dtype,
+        )
         self.gelu = nn.GELU()
-        self.c_proj = RowParallelLinear(scale * emd_size, emd_size, input_is_parallel=True, init_method=init_method)
+        self.c_proj = RowParallelLinear(
+            scale * emd_size,
+            emd_size,
+            input_is_parallel=True,
+            init_method=init_method,
+            use_cpu_initialization=use_cpu_initialization,
+            params_dtype=params_dtype,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -136,7 +275,16 @@ class ParallelMLP(nn.Module):
 
 
 class ParallelCausalSelfAttention(nn.Module):
-    def __init__(self, emd_size, num_heads, max_seq_length, dropout=0.1, bias=True):
+    def __init__(
+        self,
+        emd_size,
+        num_heads,
+        max_seq_length,
+        dropout=0.1,
+        bias=True,
+        use_cpu_initialization=False,
+        params_dtype=torch.float32,
+    ):
         super().__init__()
         world_size = get_tensor_model_parallel_world_size()
         assert emd_size % num_heads == 0, "Embedding size must be divisible by number of heads."
@@ -153,6 +301,8 @@ class ParallelCausalSelfAttention(nn.Module):
             gather_output=False,
             init_method=init_method,
             bias=bias,
+            use_cpu_initialization=use_cpu_initialization,
+            params_dtype=params_dtype,
         )
         self.c_proj = RowParallelLinear(
             emd_size,
@@ -160,6 +310,8 @@ class ParallelCausalSelfAttention(nn.Module):
             input_is_parallel=True,
             init_method=init_method,
             bias=bias,
+            use_cpu_initialization=use_cpu_initialization,
+            params_dtype=params_dtype,
         )
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
@@ -179,7 +331,8 @@ class ParallelCausalSelfAttention(nn.Module):
         causal_mask = self.bias[:, :, :seq_length, :seq_length] == 0
         attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
         attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
+        with fork_tensor_model_parallel_rng():
+            attn_weights = self.attn_dropout(attn_weights)
 
         attn_output = torch.matmul(attn_weights, v)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
@@ -191,12 +344,36 @@ class ParallelCausalSelfAttention(nn.Module):
 
 
 class ParallelBlock(nn.Module):
-    def __init__(self, emd_size, num_heads, max_seq_length, mlp_scale=4, dropout=0.1, bias=True):
+    def __init__(
+        self,
+        emd_size,
+        num_heads,
+        max_seq_length,
+        mlp_scale=4,
+        dropout=0.1,
+        bias=True,
+        use_cpu_initialization=False,
+        params_dtype=torch.float32,
+    ):
         super().__init__()
         self.ln1 = LayerNorm(emd_size)
-        self.attn = ParallelCausalSelfAttention(emd_size, num_heads, max_seq_length, dropout, bias=bias)
+        self.attn = ParallelCausalSelfAttention(
+            emd_size,
+            num_heads,
+            max_seq_length,
+            dropout,
+            bias=bias,
+            use_cpu_initialization=use_cpu_initialization,
+            params_dtype=params_dtype,
+        )
         self.ln2 = LayerNorm(emd_size)
-        self.mlp = ParallelMLP(emd_size, mlp_scale, dropout)
+        self.mlp = ParallelMLP(
+            emd_size,
+            mlp_scale,
+            dropout,
+            use_cpu_initialization=use_cpu_initialization,
+            params_dtype=params_dtype,
+        )
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -214,6 +391,8 @@ class GPTConfig:
     mlp_scale: int = 4
     dropout: float = 0.0
     bias: bool = True
+    use_cpu_initialization: bool = False
+    params_dtype: torch.dtype = torch.float32
 
 
 class GPT(nn.Module):
@@ -223,7 +402,12 @@ class GPT(nn.Module):
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
         self.parallel_output = True
 
-        self.token_embedding = VocabParallelEmbedding(config.vocab_size, config.emd_size)
+        self.token_embedding = VocabParallelEmbedding(
+            config.vocab_size,
+            config.emd_size,
+            use_cpu_initialization=config.use_cpu_initialization,
+            params_dtype=config.params_dtype,
+        )
         self.position_embedding = nn.Embedding(config.max_seq_length, config.emd_size)
         self.blocks = nn.ModuleList(
             [
@@ -234,6 +418,8 @@ class GPT(nn.Module):
                     config.mlp_scale,
                     config.dropout,
                     bias=config.bias,
+                    use_cpu_initialization=config.use_cpu_initialization,
+                    params_dtype=config.params_dtype,
                 )
                 for _ in range(config.num_layers)
             ]
