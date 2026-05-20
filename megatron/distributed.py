@@ -1,6 +1,7 @@
 import torch
 
 
+_GLOBAL_COMM_GROUP = None
 _MODEL_PARALLEL_GROUP = None
 _TENSOR_MODEL_PARALLEL_GROUP = None
 _DATA_PARALLEL_GROUP = None
@@ -18,6 +19,8 @@ def ensure_divisibility(numerator, denominator):
 
 def model_parallel_is_initialized():
     return (
+        _GLOBAL_COMM_GROUP is not None
+        and
         _MODEL_PARALLEL_GROUP is not None
         and _TENSOR_MODEL_PARALLEL_GROUP is not None
         and _DATA_PARALLEL_GROUP is not None
@@ -25,6 +28,7 @@ def model_parallel_is_initialized():
 
 
 def initialize_model_parallel(tensor_model_parallel_size_=1):
+    global _GLOBAL_COMM_GROUP
     global _MODEL_PARALLEL_GROUP
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP
@@ -32,6 +36,7 @@ def initialize_model_parallel(tensor_model_parallel_size_=1):
     global _WORLD_SIZE
 
     assert torch.distributed.is_initialized(), "torch.distributed must be initialized first."
+    assert _GLOBAL_COMM_GROUP is None, "global communication group is already initialized"
     assert _MODEL_PARALLEL_GROUP is None, "model parallel group is already initialized"
     assert _TENSOR_MODEL_PARALLEL_GROUP is None, "tensor model parallel group is already initialized"
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
@@ -46,6 +51,7 @@ def initialize_model_parallel(tensor_model_parallel_size_=1):
 
     _GLOBAL_RANK = rank
     _WORLD_SIZE = world_size
+    _GLOBAL_COMM_GROUP = torch.distributed.group.WORLD
 
     all_data_parallel_group_ranks = []
 
@@ -70,6 +76,7 @@ def initialize_model_parallel(tensor_model_parallel_size_=1):
 
 
 def destroy_model_parallel():
+    global _GLOBAL_COMM_GROUP
     global _MODEL_PARALLEL_GROUP
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP
@@ -78,6 +85,7 @@ def destroy_model_parallel():
     global _GLOBAL_RANK
     global _WORLD_SIZE
 
+    _GLOBAL_COMM_GROUP = None
     _MODEL_PARALLEL_GROUP = None
     _TENSOR_MODEL_PARALLEL_GROUP = None
     _DATA_PARALLEL_GROUP = None
@@ -85,6 +93,11 @@ def destroy_model_parallel():
     _MPU_TENSOR_MODEL_PARALLEL_RANK = None
     _GLOBAL_RANK = None
     _WORLD_SIZE = None
+
+
+def get_global_group():
+    assert _GLOBAL_COMM_GROUP is not None, "global communication group is not initialized"
+    return _GLOBAL_COMM_GROUP
 
 
 def get_model_parallel_group():
