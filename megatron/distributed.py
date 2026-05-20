@@ -53,6 +53,14 @@ def initialize_model_parallel(tensor_model_parallel_size_=1):
     _WORLD_SIZE = world_size
     _GLOBAL_COMM_GROUP = torch.distributed.group.WORLD
 
+    if rank == 0:
+        print(
+            f"[rank 0] creating communication groups: world_size={world_size}, "
+            f"tensor_model_parallel_size={tensor_model_parallel_size}, "
+            f"data_parallel_size={data_parallel_size}",
+            flush=True,
+        )
+
     all_data_parallel_group_ranks = []
 
     for i in range(tensor_model_parallel_size):
@@ -73,6 +81,13 @@ def initialize_model_parallel(tensor_model_parallel_size_=1):
         group = torch.distributed.new_group(ranks)
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
+
+    print(
+        f"[rank {rank}] group assignment done: tp_rank={get_tensor_model_parallel_rank()}, "
+        f"tp_world={get_tensor_model_parallel_world_size()}, dp_rank={get_data_parallel_rank()}, "
+        f"dp_world={get_data_parallel_world_size()}",
+        flush=True,
+    )
 
 
 def destroy_model_parallel():

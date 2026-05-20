@@ -94,12 +94,18 @@ def initialize_random_seed(seed):
     torch.manual_seed(seed)
 
     if torch.cuda.device_count() == 0:
+        print(f"[rank 0] random seeds initialized on cpu only with seed={seed}", flush=True)
         return
 
     tensor_model_parallel_seed = seed + 2718 + get_tensor_model_parallel_rank()
     _CUDA_RNG_STATE_TRACKER.reset()
     torch.cuda.manual_seed(seed)
     _CUDA_RNG_STATE_TRACKER.add(_TENSOR_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
+    print(
+        f"[rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}] "
+        f"random seeds ready: default_cuda_seed={seed}, tp_seed={tensor_model_parallel_seed}",
+        flush=True,
+    )
 
 
 @contextlib.contextmanager

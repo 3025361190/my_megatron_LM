@@ -15,6 +15,17 @@ from model import GPT, GPTConfig
 from random import initialize_random_seed
 
 
+def log_rank(message, rank=None, only_rank0=False):
+    if rank is None and dist.is_initialized():
+        rank = dist.get_rank()
+    elif rank is None:
+        rank = 0
+
+    if only_rank0 and rank != 0:
+        return
+    print(f"[rank {rank}] {message}", flush=True)
+
+
 class CharDataset(Dataset):
     def __init__(self, text, block_size, stoi):
         self.block_size = block_size
@@ -32,7 +43,7 @@ class CharDataset(Dataset):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Megatron GPT (TP + DP only).")
-    parser.add_argument("--tensor_model_parallel_size", type=int, default=1)
+    parser.add_argument("--tensor_model_parallel_size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=8)
@@ -49,12 +60,13 @@ def parse_args():
     parser.add_argument("--num_layers", type=int, default=12)
     parser.add_argument("--mlp_scale", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--bias", action="store_true")
+    parser.add_argument("--bias", action="store_true", default=True)
     parser.add_argument("--use_cpu_initialization", action="store_true")
     return parser.parse_args()
 
 
 def initialize_distributed(args):
+    log_rank("starting torch.distributed initialization", rank=0, only_rank0=True)
     if not dist.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(backend=backend, init_method="env://")
@@ -66,16 +78,24 @@ def initialize_distributed(args):
         torch.cuda.set_device(local_rank)
 
     initialize_model_parallel(args.tensor_model_parallel_size)
+    log_rank(
+        f"distributed initialized: world_size={dist.get_world_size()}, local_rank={local_rank}, "
+        f"tp={args.tensor_model_parallel_size}, dp={dist.get_world_size() // args.tensor_model_parallel_size}",
+        rank=rank,
+    )
     return rank, local_rank
 
 
 def initialize_megatron(args):
+    log_rank("initializing megatron runtime", rank=0, only_rank0=True)
     rank, local_rank = initialize_distributed(args)
     initialize_random_seed(args.seed)
+    log_rank(f"random seed initialized with seed={args.seed}", rank=rank)
     return rank, local_rank
 
 
 def build_model(args, device):
+    log_rank("building GPT model", rank=0, only_rank0=True)
     config = GPTConfig(
         vocab_size=args.vocab_size,
         emd_size=args.emd_size,
@@ -91,6 +111,7 @@ def build_model(args, device):
     model = GPT(config)
     if device.type == "cuda":
         model = model.to(device)
+    log_rank(f"model moved to device {device}", rank=0, only_rank0=True)
     return model
 
 
@@ -136,10 +157,16 @@ def build_optimizer(model, learning_rate=3e-4, weight_decay=0.1, betas=(0.9, 0.9
         {"params": [param_dict[name] for name in sorted(decay_params)], "weight_decay": weight_decay},
         {"params": [param_dict[name] for name in sorted(no_decay_params)], "weight_decay": 0.0},
     ]
+    log_rank(
+        f"optimizer parameter groups ready: decay={len(decay_params)}, no_decay={len(no_decay_params)}",
+        rank=0,
+        only_rank0=True,
+    )
     return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
 
 
 def build_dataloaders(args):
+    log_rank(f"loading dataset from {args.data}", rank=0, only_rank0=True)
     text = Path(args.data).read_text(encoding="utf-8")
     chars = sorted(set(text))
     stoi = {ch: i for i, ch in enumerate(chars)}
@@ -186,6 +213,12 @@ def build_dataloaders(args):
         sampler=val_sampler,
         shuffle=False,
     )
+    log_rank(
+        f"dataloaders ready: total_tokens={len(text)}, train_samples={len(train_dataset)}, "
+        f"val_samples={len(val_dataset)}, batch_size={args.batch_size}",
+        rank=0,
+        only_rank0=True,
+    )
     return train_loader, val_loader, train_sampler, val_sampler, stoi, itos
 
 
@@ -203,6 +236,7 @@ def train_one_epoch(
     model.train()
     train_sampler.set_epoch(epoch)
     optimizer.zero_grad(set_to_none=True)
+    log_rank(f"starting epoch {epoch + 1}", rank=rank, only_rank0=True)
 
     for step, (x, y) in enumerate(train_loader):
         x = x.to(device, non_blocking=True)
@@ -231,10 +265,12 @@ def train_one_epoch(
     if len(train_loader) % gradient_accumulation_steps != 0:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+    log_rank(f"finished epoch {epoch + 1}", rank=rank, only_rank0=True)
 
 
 def main():
     args = parse_args()
+    log_rank(f"launching training from {Path(__file__).resolve()}", rank=0, only_rank0=True)
     rank, local_rank = initialize_megatron(args)
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
     model = build_model(args, device)
@@ -244,16 +280,16 @@ def main():
 
 
     if rank == 0:
-        print("distributed initialization done")
-        print(f"tensor_model_parallel_size = {args.tensor_model_parallel_size}")
-        print(f"seed = {args.seed}")
-        print("model instantiated and wrapped with DDP")
-        print(model)
-        print("optimizer constructed")
-        print(optimizer)
-        print(f"train batches = {len(train_loader)}")
-        print(f"val batches = {len(val_loader)}")
-        print(f"vocab size = {len(stoi)}")
+        print("distributed initialization done", flush=True)
+        print(f"tensor_model_parallel_size = {args.tensor_model_parallel_size}", flush=True)
+        print(f"seed = {args.seed}", flush=True)
+        print("model instantiated and wrapped with DDP", flush=True)
+        print(model, flush=True)
+        print("optimizer constructed", flush=True)
+        print(optimizer, flush=True)
+        print(f"train batches = {len(train_loader)}", flush=True)
+        print(f"val batches = {len(val_loader)}", flush=True)
+        print(f"vocab size = {len(stoi)}", flush=True)
 
     if torch.cuda.is_available():
         print(f"rank {rank}: using cuda device {local_rank}")
