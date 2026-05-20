@@ -5,18 +5,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from distributed import (
-    VocabUtility,
-    copy_to_tensor_model_parallel_region,
-    divide,
-    gather_from_tensor_model_parallel_region,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    reduce_from_tensor_model_parallel_region,
-    scatter_to_tensor_model_parallel_region,
-    vocab_parallel_cross_entropy,
-)
-from random import fork_tensor_model_parallel_rng
+try:
+    from .distributed import (
+        VocabUtility,
+        copy_to_tensor_model_parallel_region,
+        divide,
+        gather_from_tensor_model_parallel_region,
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+        reduce_from_tensor_model_parallel_region,
+        scatter_to_tensor_model_parallel_region,
+        vocab_parallel_cross_entropy,
+    )
+    from .rng import fork_tensor_model_parallel_rng
+except ImportError:
+    from distributed import (
+        VocabUtility,
+        copy_to_tensor_model_parallel_region,
+        divide,
+        gather_from_tensor_model_parallel_region,
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+        reduce_from_tensor_model_parallel_region,
+        scatter_to_tensor_model_parallel_region,
+        vocab_parallel_cross_entropy,
+    )
+    from rng import fork_tensor_model_parallel_rng
 
 
 def init_method_normal(std):

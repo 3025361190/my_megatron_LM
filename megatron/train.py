@@ -2,6 +2,7 @@ import argparse
 import os
 from pathlib import Path
 from contextlib import nullcontext
+from urllib.request import urlretrieve
 
 import torch
 import torch.distributed as dist
@@ -10,9 +11,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, random_split
 from torch.utils.data.distributed import DistributedSampler
 
-from distributed import get_data_parallel_group, initialize_model_parallel
-from model import GPT, GPTConfig
-from random import initialize_random_seed
+try:
+    from .distributed import get_data_parallel_group, initialize_model_parallel
+    from .model import GPT, GPTConfig
+    from .rng import initialize_random_seed
+except ImportError:
+    from distributed import get_data_parallel_group, initialize_model_parallel
+    from model import GPT, GPTConfig
+    from rng import initialize_random_seed
 
 
 def log_rank(message, rank=None, only_rank0=False):
@@ -45,7 +51,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Megatron GPT (TP + DP only).")
     parser.add_argument("--tensor_model_parallel_size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument("--data", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=1)
@@ -63,6 +69,31 @@ def parse_args():
     parser.add_argument("--bias", action="store_true", default=True)
     parser.add_argument("--use_cpu_initialization", action="store_true")
     return parser.parse_args()
+
+
+def resolve_data_path(data_arg):
+    if data_arg is not None:
+        data_path = Path(data_arg)
+        if not data_path.exists():
+            raise FileNotFoundError(f"Data file not found: {data_path}")
+        return data_path
+
+    data_dir = Path(__file__).resolve().parent / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    data_path = data_dir / "tinyshakespeare.txt"
+
+    if not data_path.exists():
+        url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+        log_rank(f"downloading default dataset to {data_path}", rank=0, only_rank0=True)
+        try:
+            urlretrieve(url, data_path)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to download the default dataset. "
+                "Please rerun with --data pointing to a local text file."
+            ) from exc
+
+    return data_path
 
 
 def initialize_distributed(args):
@@ -166,8 +197,9 @@ def build_optimizer(model, learning_rate=3e-4, weight_decay=0.1, betas=(0.9, 0.9
 
 
 def build_dataloaders(args):
-    log_rank(f"loading dataset from {args.data}", rank=0, only_rank0=True)
-    text = Path(args.data).read_text(encoding="utf-8")
+    data_path = resolve_data_path(args.data)
+    log_rank(f"loading dataset from {data_path}", rank=0, only_rank0=True)
+    text = data_path.read_text(encoding="utf-8")
     chars = sorted(set(text))
     stoi = {ch: i for i, ch in enumerate(chars)}
     itos = {i: ch for ch, i in stoi.items()}
@@ -219,7 +251,7 @@ def build_dataloaders(args):
         rank=0,
         only_rank0=True,
     )
-    return train_loader, val_loader, train_sampler, val_sampler, stoi, itos
+    return train_loader, val_loader, train_sampler, val_sampler, stoi, itos, data_path
 
 
 def train_one_epoch(
@@ -276,7 +308,7 @@ def main():
     model = build_model(args, device)
     model = wrap_with_ddp(model, device)
     optimizer = build_optimizer(model, learning_rate=args.learning_rate, weight_decay=args.weight_decay)
-    train_loader, val_loader, train_sampler, val_sampler, stoi, itos = build_dataloaders(args)
+    train_loader, val_loader, train_sampler, val_sampler, stoi, itos, data_path = build_dataloaders(args)
 
 
     if rank == 0:
@@ -287,6 +319,7 @@ def main():
         print(model, flush=True)
         print("optimizer constructed", flush=True)
         print(optimizer, flush=True)
+        print(f"data path = {data_path}", flush=True)
         print(f"train batches = {len(train_loader)}", flush=True)
         print(f"val batches = {len(val_loader)}", flush=True)
         print(f"vocab size = {len(stoi)}", flush=True)

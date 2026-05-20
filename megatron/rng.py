@@ -6,7 +6,10 @@ import torch
 from torch import _C
 from torch.cuda import _lazy_call, device as device_ctx_manager
 
-from distributed import get_tensor_model_parallel_rank
+try:
+    from .distributed import get_tensor_model_parallel_rank
+except ImportError:
+    from distributed import get_tensor_model_parallel_rank
 
 
 _TENSOR_MODEL_PARALLEL_RNG_TRACKER_NAME = "tensor-model-parallel-rng"
