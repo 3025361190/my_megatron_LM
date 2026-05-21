@@ -12,11 +12,21 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from torch.utils.data.distributed import DistributedSampler
 
 try:
-    from .distributed import get_data_parallel_group, initialize_model_parallel
+    from .distributed import (
+        get_data_parallel_group,
+        get_data_parallel_rank,
+        get_data_parallel_world_size,
+        initialize_model_parallel,
+    )
     from .model import GPT, GPTConfig
     from .rng import initialize_random_seed
 except ImportError:
-    from distributed import get_data_parallel_group, initialize_model_parallel
+    from distributed import (
+        get_data_parallel_group,
+        get_data_parallel_rank,
+        get_data_parallel_world_size,
+        initialize_model_parallel,
+    )
     from model import GPT, GPTConfig
     from rng import initialize_random_seed
 
@@ -220,16 +230,19 @@ def build_dataloaders(args):
         generator=torch.Generator().manual_seed(args.seed),
     )
 
+    dp_world_size = get_data_parallel_world_size() if dist.is_initialized() else 1
+    dp_rank = get_data_parallel_rank() if dist.is_initialized() else 0
+
     train_sampler = DistributedSampler(
         train_dataset,
-        num_replicas=dist.get_world_size(),
-        rank=dist.get_rank(),
+        num_replicas=dp_world_size,
+        rank=dp_rank,
         shuffle=True,
     )
     val_sampler = DistributedSampler(
         val_dataset,
-        num_replicas=dist.get_world_size(),
-        rank=dist.get_rank(),
+        num_replicas=dp_world_size,
+        rank=dp_rank,
         shuffle=False,
     )
 
@@ -247,7 +260,8 @@ def build_dataloaders(args):
     )
     log_rank(
         f"dataloaders ready: total_tokens={len(text)}, train_samples={len(train_dataset)}, "
-        f"val_samples={len(val_dataset)}, batch_size={args.batch_size}",
+        f"val_samples={len(val_dataset)}, batch_size={args.batch_size}, "
+        f"dp_world_size={dp_world_size}",
         rank=0,
         only_rank0=True,
     )
