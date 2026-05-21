@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--vocab_size", type=int, default=50257)
+    parser.add_argument("--vocab_size", type=int, default=50258)
     parser.add_argument("--emd_size", type=int, default=768)
     parser.add_argument("--max_seq_length", type=int, default=1024)
     parser.add_argument("--num_heads", type=int, default=12)
